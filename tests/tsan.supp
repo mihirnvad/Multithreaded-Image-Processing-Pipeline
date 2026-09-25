@@ -1,0 +1,9 @@
+# ThreadSanitizer suppressions for third-party, non-instrumented libraries.
+# Use with: TSAN_OPTIONS="suppressions=tests/tsan.supp"
+#
+# Ubuntu's libopencv_imgcodecs links GDAL, whose static initializers take two
+# internal mutexes in an order TSan flags as a potential inversion. This runs
+# before main() and never involves pipeline code. Nothing in this repository
+# is suppressed.
+deadlock:libgdal.so
+race:libgdal.so

@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release (gcc)
+            cxx: g++
+            build_type: Release
+            flags: -DWARNINGS_AS_ERRORS=ON
+          - name: release (clang)
+            cxx: clang++
+            build_type: Release
+            flags: -DWARNINGS_AS_ERRORS=ON
+          - name: thread-sanitizer
+            cxx: clang++
+            build_type: Debug
+            flags: -DENABLE_TSAN=ON
+          - name: address+ub-sanitizer
+            cxx: clang++
+            build_type: Debug
+            flags: -DENABLE_ASAN=ON
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang libclang-rt-dev llvm libopencv-dev
+
+      # Ubuntu 24.04 runners use 32 bits of mmap ASLR entropy, which sanitizer
+      # runtimes cannot map around; reduce it for the sanitizer jobs.
+      - name: Adjust ASLR for sanitizers
+        if: contains(matrix.flags, 'SAN')
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} ${{ matrix.flags }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Queue stress test (32 threads, 100k items)
+        env:
+          TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ./build/test_queue
+
+      # Parallel output must match the sequential baseline exactly. Under TSan
+      # only GDAL's static initializers (pulled in by libopencv_imgcodecs) are
+      # suppressed; see tests/tsan.supp.
+      - name: Pipeline integration test
+        env:
+          TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 suppressions=${{ github.workspace }}/tests/tsan.supp
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ./build/test_pipeline
+
+  smoke-benchmark:
+    name: smoke benchmark + charts
+    runs-on: ubuntu-24.04
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build libopencv-dev \
+            python3-numpy python3-opencv python3-matplotlib
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Generate dataset, benchmark, visualize
+        run: |
+          python3 scripts/generate_synthetic_dataset.py --count 40 --width 1280 --height 720 --output data/ci
+          python3 scripts/benchmark.py --binary build/image_pipeline --data data/ci --threads 1 2 4 --repeats 1
+          ./build/image_pipeline --input data/ci --output results/images --feature-maps --metrics results/metrics_annotated.csv
+          python3 scripts/visualize_metrics.py --results results --images results/images --data data/ci --out results/charts
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            results/benchmark_summary.csv
+            results/system_info.json
+            results/charts/

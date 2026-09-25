@@ -1,0 +1,7 @@
+build/
+build-*/
+data/
+results/
+assets/
+.git/
+**/__pycache__
