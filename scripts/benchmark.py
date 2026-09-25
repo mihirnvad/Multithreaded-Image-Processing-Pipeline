@@ -127,62 +127,80 @@ def main() -> int:
     (args.results / "warmup.csv").unlink(missing_ok=True)
 
     configs: list[tuple[str, int | None]] = [("sequential", None)] + [("parallel", t) for t in args.threads]
+    walls: dict[int, list[float]] = {i: [] for i in range(len(configs))}
+    summaries: dict[int, list[dict]] = {i: [] for i in range(len(configs))}
+
+    # Round-robin: every repeat sweeps all configurations in turn, so slow
+    # drift on the host (thermal throttling, background processes) is spread
+    # evenly instead of landing on whichever configuration happened to run
+    # during it.
+    for rep_index in range(args.repeats):
+        print(f"repeat {rep_index + 1}/{args.repeats}", flush=True)
+        for i, (mode, threads) in enumerate(configs):
+            label = "seq" if threads is None else f"t{threads}"
+            wall_s, summary = run_once(args.binary, args.data, args.results / f"metrics_{label}.csv", threads,
+                                       args.queue_size, images_out, args.save_images)
+            walls[i].append(wall_s)
+            summaries[i].append(summary)
+            print(f"  {mode:>10} threads={1 if threads is None else threads:>2}  {wall_s:7.2f}s  "
+                  f"{summary['images_processed'] / wall_s:7.2f} img/s", flush=True)
+
     rows = []
-    for mode, threads in configs:
+    for i, (mode, threads) in enumerate(configs):
         label = "seq" if threads is None else f"t{threads}"
-        metrics = args.results / f"metrics_{label}.csv"
-        walls, summaries = [], []
-        for _ in range(args.repeats):
-            wall_s, summary = run_once(args.binary, args.data, metrics, threads, args.queue_size, images_out,
-                                       args.save_images)
-            walls.append(wall_s)
-            summaries.append(summary)
-        median_wall = statistics.median(walls)
-        # Report latency figures from the repeat closest to the median time.
-        rep = summaries[min(range(len(walls)), key=lambda i: abs(walls[i] - median_wall))]
+        best = min(walls[i])
+        median_wall = statistics.median(walls[i])
+        # Latency figures come from the fastest (least disturbed) repeat.
+        rep = summaries[i][walls[i].index(best)]
         images = rep["images_processed"]
         rows.append({
             "mode": mode,
             "threads": 1 if threads is None else threads,
             "images": images,
+            "wall_s_best": best,
             "wall_s_median": median_wall,
-            "wall_s_min": min(walls),
-            "wall_s_stdev": statistics.stdev(walls) if len(walls) > 1 else 0.0,
-            "throughput_ips": images / median_wall,
+            "wall_s_stdev": statistics.stdev(walls[i]) if len(walls[i]) > 1 else 0.0,
+            "throughput_ips": images / best,
+            "throughput_ips_median": images / median_wall,
             "pipeline_throughput_ips": rep["throughput_ips"],
             "mean_process_ms": rep["mean_process_ms"],
             "p50_latency_ms": rep["p50_latency_ms"],
             "p95_latency_ms": rep["p95_latency_ms"],
             "p99_latency_ms": rep["p99_latency_ms"],
-            "metrics_file": metrics.name,
+            "metrics_file": f"metrics_{label}.csv",
         })
-        print(f"  {mode:>10} threads={rows[-1]['threads']:>2}  median {median_wall:7.2f}s  "
-              f"{rows[-1]['throughput_ips']:7.2f} img/s")
 
+    # Headline speedup uses best-of-N (background noise only ever adds time);
+    # the median-based speedup is reported alongside it.
     baseline = rows[0]["throughput_ips"]
-    one_worker = next(r["throughput_ips"] for r in rows if r["mode"] == "parallel" and r["threads"] == 1) \
-        if any(r["mode"] == "parallel" and r["threads"] == 1 for r in rows) else baseline
+    baseline_median = rows[0]["throughput_ips_median"]
+    one_worker = next((r["throughput_ips"] for r in rows if r["mode"] == "parallel" and r["threads"] == 1), baseline)
     for r in rows:
         r["speedup_vs_sequential"] = r["throughput_ips"] / baseline
+        r["speedup_vs_sequential_median"] = r["throughput_ips_median"] / baseline_median
         r["speedup_vs_1_worker"] = r["throughput_ips"] / one_worker
         r["parallel_efficiency"] = r["speedup_vs_sequential"] / r["threads"]
 
     summary_path = args.results / "benchmark_summary.csv"
-    fields = ["mode", "threads", "images", "wall_s_median", "wall_s_min", "wall_s_stdev", "throughput_ips",
-              "pipeline_throughput_ips", "speedup_vs_sequential", "speedup_vs_1_worker", "parallel_efficiency",
-              "mean_process_ms", "p50_latency_ms", "p95_latency_ms", "p99_latency_ms", "metrics_file"]
+    fields = ["mode", "threads", "images", "wall_s_best", "wall_s_median", "wall_s_stdev", "throughput_ips",
+              "throughput_ips_median", "pipeline_throughput_ips", "speedup_vs_sequential",
+              "speedup_vs_sequential_median", "speedup_vs_1_worker", "parallel_efficiency", "mean_process_ms",
+              "p50_latency_ms", "p95_latency_ms", "p99_latency_ms", "metrics_file"]
     with open(summary_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for r in rows:
             writer.writerow({k: (f"{v:.4f}" if isinstance(v, float) else v) for k, v in r.items()})
 
-    print(f"\n{'mode':>10} {'thr':>4} {'wall(s)':>9} {'img/s':>8} {'speedup':>8} {'eff':>6} {'p99(ms)':>9}")
+    print(f"\n{'mode':>10} {'thr':>4} {'best(s)':>8} {'med(s)':>8} {'sd(s)':>6} {'img/s':>7} "
+          f"{'speedup':>8} {'(median)':>9} {'eff':>5}")
     for r in rows:
-        print(f"{r['mode']:>10} {r['threads']:>4} {r['wall_s_median']:>9.2f} {r['throughput_ips']:>8.2f} "
-              f"{r['speedup_vs_sequential']:>7.2f}x {r['parallel_efficiency']:>6.0%} {r['p99_latency_ms']:>9.1f}")
+        print(f"{r['mode']:>10} {r['threads']:>4} {r['wall_s_best']:>8.2f} {r['wall_s_median']:>8.2f} "
+              f"{r['wall_s_stdev']:>6.2f} {r['throughput_ips']:>7.2f} {r['speedup_vs_sequential']:>7.2f}x "
+              f"{r['speedup_vs_sequential_median']:>8.2f}x {r['parallel_efficiency']:>5.0%}")
     best = max(rows, key=lambda r: r["speedup_vs_sequential"])
-    print(f"\npeak speedup: {best['speedup_vs_sequential']:.2f}x over sequential at {best['threads']} worker threads")
+    print(f"\npeak speedup: {best['speedup_vs_sequential']:.2f}x over sequential (best of {args.repeats}), "
+          f"{best['speedup_vs_sequential_median']:.2f}x by median, at {best['threads']} worker threads")
     print(f"wrote {summary_path}")
     return 0
 

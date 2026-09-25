@@ -183,7 +183,7 @@ def plot_throughput(summary: list[dict], out: Path) -> Path:
     ax.grid(axis="x", visible=False)
     ax.set_ylabel("Images per second")
     ax.set_title("Pipeline throughput")
-    subtitle(ax, "Median of repeated runs; label shows images/s and speedup over sequential")
+    subtitle(ax, "Best of repeated round-robin runs; label shows images/s and speedup over sequential")
     fig.tight_layout()
     path = out / "throughput.png"
     fig.savefig(path, dpi=DPI)
